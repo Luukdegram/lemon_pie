@@ -32,10 +32,12 @@ pub const ParseError = error{
     /// The port was included but could not be parsed
     InvalidPort,
     /// Expected a specific character, but instead found a different one
-    UnexpectedCharacter,
+    InvalidCharacter,
     /// Host contains an IP-literal, but is missing a closing ']'
     MissingClosingBracket,
-} || std.fmt.ParseIntError;
+    /// The port number does not fit within the type (u16).
+    Overflow,
+};
 
 /// Parses a given slice `input` into a Gemini compliant URI.
 /// Produces a `ParseError` when the given input is invalid.
@@ -58,6 +60,9 @@ pub fn parse(input: []const u8) ParseError!Uri {
         path,
         query,
         fragment,
+        // when we finished a component,
+        // use this to detect what to parse next.
+        detect_next,
     };
 
     var state: State = .scheme;
@@ -74,7 +79,7 @@ pub fn parse(input: []const u8) ParseError!Uri {
                     // read until after '://'
                     index += try expectCharacters(input[index..], "://");
                 },
-                else => return error.UnexpectedCharacter, // expected ':' but found a different character
+                else => return error.InvalidCharacter, // expected ':' but found a different character
             },
             .host => switch (char) {
                 '[' => {
@@ -87,28 +92,32 @@ pub fn parse(input: []const u8) ParseError!Uri {
                             break;
                         }
                     } else return error.MissingClosingBracket;
-                    index += uri.host.len;
+                    index += uri.host.len + 1;
                 },
                 else => if (isRegName(char)) {
                     const start = index;
-                    while (isRegName(input[index])) {
+                    while (index < input.len and isRegName(input[index])) {
                         index += 1;
                     } else {
                         uri.host = input[start..index];
                     }
-                } else switch (char) {
-                    ':', '/', '?', '#' => |cur| {
-                        index += 1;
-                        state = switch (cur) {
-                            '/' => .path,
-                            '?' => .query,
-                            '#' => .fragment,
-                            ':' => .port,
-                            else => unreachable,
-                        };
-                    },
-                    else => return error.UnexpectedCharacter, // expected authority separator
+                    state = .detect_next;
+                } else {
+                    state = .detect_next;
                 },
+            },
+            .detect_next => switch (char) {
+                ':', '/', '?', '#' => |cur| {
+                    index += 1;
+                    state = switch (cur) {
+                        '/' => .path,
+                        '?' => .query,
+                        '#' => .fragment,
+                        ':' => .port,
+                        else => unreachable,
+                    };
+                },
+                else => return error.InvalidCharacter,
             },
             .port => {
                 const start = index;
@@ -117,26 +126,36 @@ pub fn parse(input: []const u8) ParseError!Uri {
                 } else {
                     uri.port = try std.fmt.parseInt(u16, input[start..index], 10);
                 }
+                state = .detect_next;
             },
             .path => {
                 const start = index;
-                while (index < input.len and isPChar(input[index])) {
-                    index += 1;
-                } else if (index < input.len) switch (input[index]) {
-                    '?' => state = .query,
-                    '#' => state = .fragment,
-                    else => return error.UnexpectedCharacter,
-                };
+                const end = if (std.mem.indexOfAnyPos(u8, input, index, "?#")) |pos| blk: {
+                    state = switch (input[pos]) {
+                        '#' => .fragment,
+                        '?' => .query,
+                        else => unreachable,
+                    };
+                    break :blk pos;
+                } else input.len;
 
-                uri.path = input[start..index];
+                uri.path = input[start..end];
+                index = end;
             },
             .query => {
-                index += 1;
-                const start = index;
-                const end = std.mem.indexOfScalarPos(u8, input, start, '#') orelse input.len;
+                const start = if (char == '?') index + 1 else index;
+                const end = if (std.mem.indexOfScalarPos(u8, input, start, '#')) |frag| blk: {
+                    state = .fragment;
+                    break :blk frag;
+                } else input.len;
                 uri.query = input[start..end];
+                index = end;
             },
-            .fragment => uri.query = input[index..input.len],
+            .fragment => {
+                const start = if (char == '#') index + 1 else index;
+                uri.fragment = input[start..input.len];
+                break;
+            },
         }
     }
     return uri;
@@ -145,9 +164,7 @@ pub fn parse(input: []const u8) ParseError!Uri {
 /// Reads over the given slice `buffer` until it reaches the given `delimiters` slice.
 /// Returns the length it read until found.
 fn expectCharacters(buffer: []const u8, delimiters: []const u8) !usize {
-    if (buffer.len < delimiters.len) return error.UnexpectedCharacter;
-
-    if (!std.mem.startsWith(u8, buffer, delimiters)) return error.UnexpectedCharacter;
+    if (!std.mem.startsWith(u8, buffer, delimiters)) return error.InvalidCharacter;
     return delimiters.len;
 }
 
@@ -210,6 +227,83 @@ test "Scheme" {
     };
 
     inline for (error_cases) |case| {
-        try std.testing.expectError(ParseError.UnexpectedCharacter, parse(case));
+        try std.testing.expectError(ParseError.InvalidCharacter, parse(case));
+    }
+}
+
+test "Host" {
+    const cases = .{
+        .{ "https://exa2ple", "exa2ple" },
+        .{ "gemini://example.com", "example.com" },
+        .{ "git://sub.domain.com", "sub.domain.com" },
+        .{ "https://[2001:db8:0:0:0:0:2:1]", "2001:db8:0:0:0:0:2:1" },
+    };
+    inline for (cases) |case| {
+        const uri = try parse(case[0]);
+        try std.testing.expectEqualStrings(case[1], uri.host);
+    }
+
+    const error_cases = .{
+        "https://exam|", "gemini://exa\"", "git://sub.example.[om",
+    };
+
+    inline for (error_cases) |case| {
+        try std.testing.expectError(ParseError.InvalidCharacter, parse(case));
+    }
+}
+
+test "Port" {
+    const cases = .{
+        .{ "gemini://example.com:100", 100 },
+        .{ "gemini://example.com:8080", 8080 },
+        .{ "gemini://example.com:8080/", 8080 },
+    };
+    inline for (cases) |case| {
+        const uri = try parse(case[0]);
+        try std.testing.expectEqual(@as(u16, case[1]), uri.port.?);
+    }
+
+    const error_cases = .{
+        "https://exammple.com:10a", "https://example.com:[",
+    };
+
+    inline for (error_cases) |case| {
+        try std.testing.expectError(error.InvalidCharacter, parse(case));
+    }
+}
+
+test "Path" {
+    const cases = .{
+        .{ "gemini://example.com:100/hello", "hello" },
+        .{ "gemini://example.com/hello/world", "hello/world" },
+        .{ "gemini://example.com/../hello", "../hello" },
+    };
+    inline for (cases) |case| {
+        const uri = try parse(case[0]);
+        try std.testing.expectEqualStrings(case[1], uri.path.?);
+    }
+}
+
+test "Query" {
+    const cases = .{
+        .{ "gemini://example.com:100/hello?", "" },
+        .{ "gemini://example.com/?cool=true", "cool=true" },
+        .{ "gemini://example.com?hello=world", "hello=world" },
+    };
+    inline for (cases) |case| {
+        const uri = try parse(case[0]);
+        try std.testing.expectEqualStrings(case[1], uri.query.?);
+    }
+}
+
+test "Fragment" {
+    const cases = .{
+        .{ "gemini://example.com:100/hello?#hi", "hi" },
+        .{ "gemini://example.com/#hello", "hello" },
+        .{ "gemini://example.com#hello-world", "hello-world" },
+    };
+    inline for (cases) |case| {
+        const uri = try parse(case[0]);
+        try std.testing.expectEqualStrings(case[1], uri.fragment.?);
     }
 }
