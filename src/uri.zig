@@ -22,7 +22,7 @@ pub const Uri = struct {
     fragment: ?[]const u8,
 };
 
-pub const ParseError = struct {
+pub const ParseError = error{
     /// Gemini URI's have a maximum length of 1024 bytes.
     UriTooLong,
     /// Misses the 'gemini://' scheme
@@ -35,7 +35,7 @@ pub const ParseError = struct {
     UnexpectedCharacter,
     /// Host contains an IP-literal, but is missing a closing ']'
     MissingClosingBracket,
-};
+} || std.fmt.ParseIntError;
 
 /// Parses a given slice `input` into a Gemini compliant URI.
 /// Produces a `ParseError` when the given input is invalid.
@@ -67,18 +67,19 @@ pub fn parse(input: []const u8) ParseError!Uri {
         switch (state) {
             .scheme => switch (char) {
                 'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '.' => index += 1,
-                else => |cur| {
-                    if (cur != ':') return error.UnexpectedCharacter; // expected ':' but found a different character
+                ':' => {
                     uri.scheme = input[0..index];
                     state = .host;
 
                     // read until after '://'
                     index += try expectCharacters(input[index..], "://");
                 },
+                else => return error.UnexpectedCharacter, // expected ':' but found a different character
             },
             .host => switch (char) {
                 '[' => {
-                    const start = index + 1;
+                    index += 1;
+                    const start = index;
 
                     for (input[index..]) |cur, idx| {
                         if (cur == ']') {
@@ -96,33 +97,49 @@ pub fn parse(input: []const u8) ParseError!Uri {
                         uri.host = input[start..index];
                     }
                 } else switch (char) {
-                    // port is present
-                    ':' => {
-                        index += 1;
-                        const start = index;
-                        while (std.ascii.isDigit(input[index])) {
-                            index += 1;
-                        } else {
-                            uri.port = try std.fmt.parseInt(input[start..index], 10);
-                        }
-                    },
-                    '/', '?', '#' => |cur| {
+                    ':', '/', '?', '#' => |cur| {
                         index += 1;
                         state = switch (cur) {
                             '/' => .path,
                             '?' => .query,
                             '#' => .fragment,
+                            ':' => .port,
                             else => unreachable,
                         };
                     },
                     else => return error.UnexpectedCharacter, // expected authority separator
                 },
             },
-            .path => {},
-            .query => {},
-            .fragment => {},
+            .port => {
+                const start = index;
+                while (index < input.len and std.ascii.isDigit(input[index])) {
+                    index += 1;
+                } else {
+                    uri.port = try std.fmt.parseInt(u16, input[start..index], 10);
+                }
+            },
+            .path => {
+                const start = index;
+                while (index < input.len and isPChar(input[index])) {
+                    index += 1;
+                } else if (index < input.len) switch (input[index]) {
+                    '?' => state = .query,
+                    '#' => state = .fragment,
+                    else => return error.UnexpectedCharacter,
+                };
+
+                uri.path = input[start..index];
+            },
+            .query => {
+                index += 1;
+                const start = index;
+                const end = std.mem.indexOfScalarPos(u8, input, start, '#') orelse input.len;
+                uri.query = input[start..end];
+            },
+            .fragment => uri.query = input[index..input.len],
         }
     }
+    return uri;
 }
 
 /// Reads over the given slice `buffer` until it reaches the given `delimiters` slice.
@@ -143,7 +160,7 @@ fn isRegName(char: u8) bool {
 /// Checks if unreserved character
 /// ALPHA / DIGIT/ [ "-" / "." / "_" / "~" ]
 fn isUnreserved(char: u8) bool {
-    return std.ascii.isAlpha or std.ascii.isDigit or switch (char) {
+    return std.ascii.isAlpha(char) or std.ascii.isDigit(char) or switch (char) {
         '-', '.', '_', '~' => true,
         else => false,
     };
@@ -166,4 +183,33 @@ fn isSubDelim(char: u8) bool {
         => true,
         else => false,
     };
+}
+
+/// Returns true when given char is pchar
+/// unreserved / pct-encoded / sub-delims / ":" / "@"
+fn isPChar(char: u8) bool {
+    return switch (char) {
+        '%', ':', '@' => true,
+        else => isUnreserved(char) or isSubDelim(char),
+    };
+}
+
+test "Scheme" {
+    const cases = .{
+        .{ "https://", "https" },
+        .{ "gemini://", "gemini" },
+        .{ "git://", "git" },
+    };
+    inline for (cases) |case| {
+        const uri = try parse(case[0]);
+        try std.testing.expectEqualStrings(case[1], uri.scheme);
+    }
+
+    const error_cases = .{
+        "htt?s", "gem||", "ha$",
+    };
+
+    inline for (error_cases) |case| {
+        try std.testing.expectError(ParseError.UnexpectedCharacter, parse(case));
+    }
 }
