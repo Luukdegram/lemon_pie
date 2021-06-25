@@ -4,10 +4,10 @@
 //! by passing it from the server to the handler.
 const Request = @This();
 const std = @import("std");
-const url = @import("url.zig");
+const uri = @import("uri.zig");
 
 /// Parsed URL from the client's request.
-url: url.Url,
+url: uri.Uri,
 
 /// Parses a request, validates it and then returns a `Request` instance
 pub fn parse(reader: anytype, buffer: []u8) Parser(@TypeOf(reader)).Error!Request {
