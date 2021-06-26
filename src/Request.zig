@@ -24,7 +24,7 @@ pub const ParseError = error{
     MissingUri,
     /// The URI has a maximum length of 1024 bytes, including its scheme.
     UriTooLong,
-    /// When the provided buffer is smaller than 1024 bytes.
+    /// When the provided buffer is smaller than 1026 bytes.
     BufferTooSmall,
     /// Connection was closed by the client.
     EndOfStream,

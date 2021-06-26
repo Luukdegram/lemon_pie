@@ -92,11 +92,9 @@ pub const Server = struct {
         });
         try stream.listen(address);
 
-        // Make sure to cleanup any connections
+        // Make sure to await any open connections
         defer while (client_count > 0) : (client_count -= 1) {
-            var cleanup = clients[client_count];
-            await cleanup.frame;
-            // cleanup.stream.close();
+            await clients[client_count].frame;
         } else stream.deinit();
 
         // main loop, awaits new connections and dispatches them
@@ -153,11 +151,8 @@ fn Client(comptime handler: Handle) type {
         /// the user to customize the response. `serve` ensures the response
         /// is sent to the client by checking if `is_flushed` is set on the `Response`.
         fn serve(self: *Self, gpa: *Allocator) !void {
-            var request_buf: [1026]u8 = undefined;
-            const request = Request.parse(self.stream.reader(), &request_buf) catch |err| switch (err) {
-                error.EndOfStream => return, // connection was closed.
-                else => |e| return e,
-            };
+            // After each transaction, we close the connection.
+            defer self.stream.close();
 
             const buffered_writer = std.io.bufferedWriter(self.stream.writer());
             var body_writer = std.ArrayList(u8).init(gpa);
@@ -168,8 +163,37 @@ fn Client(comptime handler: Handle) type {
                 .body = body_writer.writer(),
             };
 
+            var request_buf: [1026]u8 = undefined;
+            const request = Request.parse(self.stream.reader(), &request_buf) catch |err| switch (err) {
+                error.EndOfStream,
+                error.ConnectionResetByPeer,
+                error.ConnectionTimedOut,
+                => return, // connection was closed/timedout.
+                error.BufferTooSmall => unreachable,
+                error.MissingCRLF,
+                error.MissingUri,
+                error.UriTooLong,
+                => {
+                    // Client has sent an invalid request. Send a response to inform them and close
+                    // the connection.
+                    try response.writeHeader(.bad_request, "Malformed request");
+                    return;
+                },
+                else => |e| {
+                    // Unhandable error, simply return it and log it.
+                    // But do attempt to send a temporary failure response.
+                    try response.writeHeader(.temporary_failure, "Unexpected error. Retry later.");
+                    return e;
+                },
+            };
+
             // call user-defined handle.
-            try handler(&response, request);
+            handler(&response, request) catch |err| {
+                // An error occured in the user's function. As we do not know the reason it failed,
+                // simply tell the client to try again later.
+                try response.writeHeader(.temporary_failure, "Unexpected error. Retry later.");
+                return err;
+            };
 
             // Ensure the response is sent to the client.
             if (!response.is_flushed) {

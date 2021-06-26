@@ -12,7 +12,7 @@ const net = std.net;
 const MimeType = @import("MimeType.zig");
 
 /// The status representing this response.
-/// By default set to "SUCCESS - 20"
+/// By default set to "20 - SUCCESS"
 status: Status = .success,
 /// Buffered writer for writing to the client.
 /// By buffering we limit the amount of syscalls and improve
@@ -37,9 +37,7 @@ pub const Error = net.Stream.WriteError;
 /// <STATUS><SPACE><META><CR><LF>
 pub const max_header_size: usize = 2 + 1 + 1024 + 1 + 1;
 
-/// Represents a status code.
-/// As the spec is not final, this is a non-exhaustive enum,
-/// allowing up to 2^6-1 values.
+/// Represents a status code as described by the Gemini spec.
 pub const Status = enum(u6) {
     /// Ask the client to send a new request with input as query parameters
     input = 10,
@@ -78,7 +76,6 @@ pub const Status = enum(u6) {
     certificate_not_authorised = 61,
     /// The provided certificate is invalid.
     certificate_not_valid = 62,
-    _,
 
     /// Returns the integer value representing the `Status`
     pub fn int(self: Status) u6 {
@@ -93,9 +90,12 @@ pub fn writeHeader(self: *Response, status: Status, meta: []const u8) Error!void
     std.debug.assert(meta.len <= 1024); // max META size is 1024 bytes
     std.debug.assert(status != .success); // success status code requires a body
 
+    // We may have written a partial response later on. Since trying to resubmit a response
+    // on error, wouldn't be parsable, ensure users cannot call `flush` again.
+    self.is_flushed = true;
+
     try self.buffered_writer.writer().print("{d} {s}\r\n", .{ status.int(), meta });
     try self.buffered_writer.flush();
-    self.is_flushed = true; // only on succesful writes
 }
 
 /// Flushes and writes the entire contents of `body` to the client.
@@ -113,6 +113,10 @@ pub fn flush(self: *Response, mime_type: MimeType) Error!void {
 
     try self.buffered_writer.writer().print("{d} {s}\r\n", .{ self.status.int(), mime_type });
 
+    // We may have written a partial response later on. Since trying to resubmit a response
+    // on error, wouldn't be parsable, ensure users cannot call `flush` again.
+    self.is_flushed = true;
+
     // write the contents of the body
     if (self.body.context.items.len != 0) {
         try self.buffered_writer.writer().writeAll(self.body.context.items);
@@ -120,6 +124,4 @@ pub fn flush(self: *Response, mime_type: MimeType) Error!void {
 
     // ensure all bytes are sent
     try self.buffered_writer.flush();
-    // only on succesful write do we set `is_flushed`
-    self.is_flushed = true;
 }
