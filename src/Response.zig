@@ -20,6 +20,10 @@ status: Status = .success,
 buffered_writer: std.io.BufferedWriter(4096, net.Stream.Writer),
 /// Determines if the response has been flushed or not
 /// This prevents double writes to the client.
+///
+/// NOTE: Setting this to `true` without actually sending a response,
+/// will cause the connection to be closed without the client receiving any response.
+/// Therefore it's recommended to not manually set this, unless ensuring a response was sent.
 is_flushed: bool = false,
 /// A writer for writing to the response body.
 /// All content is flushed at once.
@@ -107,7 +111,7 @@ pub fn flush(self: *Response, mime_type: MimeType) Error!void {
     std.debug.assert(!self.is_flushed); // it is illegal to call `flush` more than once.
     std.debug.assert(self.buffered_writer.fifo.count == 0); // It's illegal to use both the writer and `flush`.
 
-    self.buffered_writer.writer().print("{d} {s}\r\n", .{ status.int(), mime_type });
+    try self.buffered_writer.writer().print("{d} {s}\r\n", .{ self.status.int(), mime_type });
 
     // write the contents of the body
     if (self.body.context.items.len != 0) {

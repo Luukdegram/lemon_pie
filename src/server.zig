@@ -8,6 +8,7 @@ const std = @import("std");
 const root = @import("root");
 const Request = @import("Request.zig");
 const Response = @import("Response.zig");
+const MimeType = @import("MimeType.zig");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 const atomic = std.atomic;
@@ -53,7 +54,7 @@ pub const Server = struct {
         /// When false, disallows to reuse an address until full exit.
         reuse_address: bool = false,
         /// Maximum amount of connections before clients receiving "connection refused".
-        comptime max_backlog: u32 = 128,
+        max_connections: u32 = 128,
     };
 
     /// Initializes a new `Server`
@@ -81,19 +82,24 @@ pub const Server = struct {
         /// and a parsed-and-validated `Request`.
         comptime handler: Handle,
     ) !void {
-        _ = gpa;
+        var clients: [options.max_connections]Client(handler) = undefined;
+        var client_count: u32 = 0;
+
+        // initialize our tcp server and start listening
         var stream = net.StreamServer.init(.{
             .reuse_address = options.reuse_address,
-            .max_backlog = options.max_backlog,
+            .kernel_backlog = options.max_connections,
         });
-        defer stream.deinit();
-
-        defer while (client_count > 0) : (client_count -= 1) {};
-
         try stream.listen(address);
 
-        var clients: [options.max_backlog]Client(handler) = undefined;
-        var client_count: u32 = 0;
+        // Make sure to cleanup any connections
+        defer while (client_count > 0) : (client_count -= 1) {
+            var cleanup = clients[client_count];
+            await cleanup.frame;
+            // cleanup.stream.close();
+        } else stream.deinit();
+
+        // main loop, awaits new connections and dispatches them
         while (!self.should_quit.load(.SeqCst)) {
             var connection = stream.accept() catch |err| switch (err) {
                 error.ConnectionResetByPeer,
@@ -105,6 +111,7 @@ pub const Server = struct {
                 else => |e| return e,
             };
 
+            // initialize our client.
             var client: Client(handler) = .{
                 .stream = connection.stream,
                 .frame = undefined,
@@ -127,6 +134,10 @@ fn Client(comptime handler: Handle) type {
         /// Connection with the client
         stream: net.Stream,
 
+        /// Wraps `server` by catching its error and logging it to stderr.
+        /// Will also print the error trace in debug modes.
+        /// NOTE: It will not shutdown the server on an error, it will simply close
+        /// the connection with the client.
         fn run(self: *Self, gpa: *Allocator) void {
             self.serve(gpa) catch |err| {
                 log.err("An error occured handling request: '{s}'", .{@errorName(err)});
@@ -136,10 +147,85 @@ fn Client(comptime handler: Handle) type {
             };
         }
 
+        /// Handles the request and response of a transaction.
+        /// It will first parse and validate the request.
+        /// On success it will call the user-defined handle to allow
+        /// the user to customize the response. `serve` ensures the response
+        /// is sent to the client by checking if `is_flushed` is set on the `Response`.
         fn serve(self: *Self, gpa: *Allocator) !void {
-            _ = self;
-            _ = gpa;
-            _ = handler;
+            var request_buf: [1026]u8 = undefined;
+            const request = Request.parse(self.stream.reader(), &request_buf) catch |err| switch (err) {
+                error.EndOfStream => return, // connection was closed.
+                else => |e| return e,
+            };
+
+            const buffered_writer = std.io.bufferedWriter(self.stream.writer());
+            var body_writer = std.ArrayList(u8).init(gpa);
+            defer body_writer.deinit();
+
+            var response = Response{
+                .buffered_writer = buffered_writer,
+                .body = body_writer.writer(),
+            };
+
+            // call user-defined handle.
+            try handler(&response, request);
+
+            // Ensure the response is sent to the client.
+            if (!response.is_flushed) {
+                try response.flush(MimeType.fromExtension(".gmi"));
+            }
         }
     };
+}
+
+test "Full transaction" {
+    // We rely on multi-threading for the test
+    if (std.builtin.single_threaded) return error.SkipZigTest;
+
+    const ally = std.testing.allocator;
+    const addr = try net.Address.parseIp("0.0.0.0", 8081);
+    var server = Server.init();
+
+    const ServerThread = struct {
+        var _addr: net.Address = undefined;
+
+        fn index(response: *Response, req: Request) !void {
+            _ = req;
+            try response.body.writeAll("Hello, world!");
+        }
+
+        fn runServer(ctx: *Server) !void {
+            try ctx.run(ally, _addr, .{ .reuse_address = true }, index);
+        }
+    };
+    ServerThread._addr = addr;
+
+    const thread = try std.Thread.spawn(ServerThread.runServer, &server);
+    errdefer server.shutdown();
+
+    var stream = while (true) {
+        var conn = net.tcpConnectToAddress(addr) catch |err| switch (err) {
+            error.ConnectionRefused => continue,
+            else => |e| return e,
+        };
+
+        break conn;
+    } else unreachable;
+
+    errdefer stream.close();
+
+    // tell server to shutdown
+    // Will finish the current request and then shutdown
+    server.shutdown();
+    try stream.writer().writeAll("gemini://localhost\r\n");
+    var buf: [1024]u8 = undefined;
+    const len = try stream.reader().read(&buf);
+    stream.close();
+    thread.wait();
+
+    const content = buf[0..len];
+    try std.testing.expectEqualStrings("20", buf[0..2]);
+    const body_index = std.mem.indexOf(u8, content, "\r\n").?;
+    try std.testing.expectEqualStrings("Hello, world!", content[body_index + 2 ..]);
 }

@@ -47,7 +47,7 @@ fn Parser(comptime ReaderType: type) type {
 
         /// Parses the request and validates it
         fn parseAndValidate(self: *Self) Error!Request {
-            if (self.buffer.len < 1024) return error.BufferTooSmall;
+            if (self.buffer.len < 1026) return error.BufferTooSmall;
             const read = try self.reader.read(self.buffer);
             if (read == 0) return error.EndOfStream;
             if (read == 2) return error.MissingUri;
@@ -58,7 +58,7 @@ fn Parser(comptime ReaderType: type) type {
             }
 
             // verify CRLF
-            if (!std.mem.eql(u8, self.buffer[read - 2 ..], "\r\n")) {
+            if (!std.mem.eql(u8, self.buffer[read - 2 .. read], "\r\n")) {
                 return error.MissingCRLF;
             }
 
@@ -69,7 +69,7 @@ fn Parser(comptime ReaderType: type) type {
 
 test "Happy flow" {
     const valid = "gemini://example.com/hello-world\r\n";
-    var buf: [1024]u8 = undefined;
+    var buf: [1026]u8 = undefined;
     _ = try parse(std.io.fixedBufferStream(valid).reader(), &buf);
 }
 
