@@ -17,6 +17,10 @@ status: Status = .success,
 /// Buffered writer for writing to the client.
 /// By buffering we limit the amount of syscalls and improve
 /// the performance.
+///
+/// NOTE: It is allowed to directly call this instead of using `flush` and `body`.
+/// When calling this directly, ensure to set `is_flushed` to `true` to prevent
+/// sending multiple responses.
 buffered_writer: std.io.BufferedWriter(4096, net.Stream.Writer),
 /// Determines if the response has been flushed or not
 /// This prevents double writes to the client.
