@@ -225,7 +225,7 @@ test "Full transaction" {
     };
     ServerThread._addr = addr;
 
-    const thread = try std.Thread.spawn(ServerThread.runServer, &server);
+    const thread = try std.Thread.spawn(.{}, ServerThread.runServer, &server);
     errdefer server.shutdown();
 
     var stream = while (true) {
@@ -246,7 +246,7 @@ test "Full transaction" {
     var buf: [1024]u8 = undefined;
     const len = try stream.reader().read(&buf);
     stream.close();
-    thread.wait();
+    thread.join();
 
     const content = buf[0..len];
     try std.testing.expectEqualStrings("20", buf[0..2]);
