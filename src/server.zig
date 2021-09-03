@@ -225,7 +225,7 @@ test "Full transaction" {
     };
     ServerThread._addr = addr;
 
-    const thread = try std.Thread.spawn(.{}, ServerThread.runServer, &server);
+    const thread = try std.Thread.spawn(.{}, ServerThread.runServer, .{&server});
     errdefer server.shutdown();
 
     var stream = while (true) {
